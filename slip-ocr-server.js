@@ -9,6 +9,35 @@ const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { createWorker } = require('tesseract.js');
+let jpeg = null, PNG = null;
+try { jpeg = require('jpeg-js'); PNG = require('pngjs').PNG; } catch (e) { console.warn('⚠️ [OCR] ไม่มี jpeg-js/pngjs -> ไม่ขยายรูปก่อนอ่าน'); }
+
+// 🔍 เตรียมรูปก่อนอ่าน: แปลงเป็นขาวดำ + ขยายรูปเล็ก (สลิปที่ส่งผ่าน Messenger มักถูกย่อ ตัวหนังสือเล็ก อ่านพลาดง่าย)
+function prepareImage(buf, type) {
+  if (!jpeg || !PNG || (type !== 'jpeg' && type !== 'png')) return buf;
+  try {
+    const src = type === 'jpeg' ? jpeg.decode(buf, { useTArray: true, formatAsRGBA: true, maxMemoryUsageInMB: 300 }) : PNG.sync.read(buf);
+    const w = src.width, h = src.height, d = src.data;
+    const TARGET = Number(process.env.OCR_TARGET_WIDTH) || 1500;
+    const scale = Math.min(3, Math.max(1, TARGET / w));
+    const W = Math.round(w * scale), H = Math.round(h * scale);
+    if (W * H > 12e6) return buf;
+    // ขาวดำ
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    const out = new PNG({ width: W, height: H });
+    for (let y = 0; y < H; y++) {
+      const fy = Math.min(h - 1, (y + 0.5) / scale - 0.5), y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(h - 1, y0 + 1), ty = Math.max(0, fy - y0);
+      for (let x = 0; x < W; x++) {
+        const fx = Math.min(w - 1, (x + 0.5) / scale - 0.5), x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(w - 1, x0 + 1), tx = Math.max(0, fx - x0);
+        const v = (g[y0 * w + x0] * (1 - tx) + g[y0 * w + x1] * tx) * (1 - ty) + (g[y1 * w + x0] * (1 - tx) + g[y1 * w + x1] * tx) * ty;
+        const k = (y * W + x) * 4;
+        out.data[k] = out.data[k + 1] = out.data[k + 2] = v; out.data[k + 3] = 255;
+      }
+    }
+    return PNG.sync.write(out);
+  } catch (e) { console.error('⚠️ [OCR] เตรียมรูปไม่สำเร็จ ใช้รูปเดิม:', e.message); return buf; }
+}
 
 const PORT = process.env.PORT || 3000;
 const OCR_SECRET = String(process.env.OCR_SECRET || '');
@@ -81,13 +110,14 @@ app.post('/ocr', async (req, res) => {
   if (!b64) return res.status(400).json({ success: false, error: 'NO_IMAGE' });
   const buf = Buffer.from(b64, 'base64');
   if (buf.length > MAX_BYTES) return res.status(413).json({ success: false, error: 'FILE_TOO_LARGE' });
-  if (!imageType(buf)) return res.status(415).json({ success: false, error: 'IMAGE_FORMAT_UNSUPPORTED' });
+  const type = imageType(buf);
+  if (!type) return res.status(415).json({ success: false, error: 'IMAGE_FORMAT_UNSUPPORTED' });
   if (pending >= MAX_QUEUE) return res.status(503).json({ success: false, error: 'BUSY' });
   const t0 = Date.now();
   try {
     const out = await runQueued(async () => {
       const w = await getWorker();
-      const { data } = await w.recognize(buf);
+      const { data } = await w.recognize(prepareImage(buf, type));
       return { text: String(data.text || ''), confidence: Math.round(Number(data.confidence) || 0) };
     });
     const ms = Date.now() - t0;

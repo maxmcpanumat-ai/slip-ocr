@@ -68,7 +68,9 @@ function needEngPass(text) {
   const acc = (String(text || '').match(/(?<![A-Za-z0-9])[xX*%\d](?:[xX*%\d\- ]{5,20})[xX*%\d](?![A-Za-z0-9])/g) || [])
     .filter(x => (x.match(/\d/g) || []).length >= 3 && /[xX*%]/.test(x) && x.replace(/[^0-9xX*%]/g, '').length >= 9);
   if (new Set(acc.map(a => a.replace(/[^0-9]/g, ''))).size < 2) return true;
-  return !/\d\s?[.,]\s?\d\d(?!\d)/.test(String(text || '')); // ไม่เจอยอดเงิน (x.xx) -> อ่านรอบ 2 ช่วยหายอด
+  // ไม่เจอยอดเงิน (x.xx ที่มากกว่า 0 · ค่าธรรมเนียม 0.00 ไม่นับ) -> อ่านรอบ 2 ช่วยหายอด
+  const money = (String(text || '').match(/\d[\d,]*\s?[.,]\s?\d\d(?!\d)/g) || []).map(x => parseFloat(x.replace(/\s/g, '').replace(/,(?=\d{3})/g, '').replace(',', '.')));
+  return !money.some(v => v > 0);
 }
 async function recycleIfHeavy() {
   const rss = Math.round(process.memoryUsage().rss / 1048576);

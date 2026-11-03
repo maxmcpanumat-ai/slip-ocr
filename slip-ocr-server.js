@@ -43,7 +43,8 @@ function getMain() {
     const t0 = Date.now();
     mainP = (async () => {
       const w = await createWorker(LANGS, 1, workerOpts());
-      await w.setParameters({ preserve_interword_spaces: '1' });
+      // ⚡ tessedit_do_invert=0: ไม่ต้องลองอ่านแบบกลับสีทุกบรรทัด (สลิปเป็นตัวหนังสือเข้มบนพื้นสว่าง) -> เร็วขึ้น
+      await w.setParameters({ preserve_interword_spaces: '1', tessedit_do_invert: process.env.OCR_INVERT === '1' ? '1' : '0' });
       if (!readyAt) console.log('✅ [OCR] พร้อมใช้งาน (' + LANGS.join('+') + (ENG_PASS ? ' + รอบตัวเลข' : '') + ') ใน ' + (Date.now() - t0) + ' ms');
       readyAt = Date.now();
       return w;
@@ -67,7 +68,9 @@ async function engPass(img) {
 function needEngPass(text) {
   const acc = (String(text || '').match(/(?<![A-Za-z0-9])[xX*%\d](?:[xX*%\d\- ]{5,20})[xX*%\d](?![A-Za-z0-9])/g) || [])
     .filter(x => (x.match(/\d/g) || []).length >= 3 && /[xX*%]/.test(x) && x.replace(/[^0-9xX*%]/g, '').length >= 9);
-  if (new Set(acc.map(a => a.replace(/[^0-9]/g, ''))).size < 2) return true;
+  // บัญชีผู้รับแบบสั้นหลังคำว่า ไปยัง (SCB: "x-0129") ถือว่าอ่านได้แล้ว
+  const shortTo = /(ไปยัง|ไปที่)[\s\S]{0,120}?(?<![A-Za-z0-9])[xX*%]{1,8}-?\d{4}(?!\d)/.test(String(text || ''));
+  if (new Set(acc.map(a => a.replace(/[^0-9]/g, ''))).size < 2 && !shortTo) return true;
   // ไม่เจอยอดเงิน (x.xx ที่มากกว่า 0 · ค่าธรรมเนียม 0.00 ไม่นับ) -> อ่านรอบ 2 ช่วยหายอด
   const money = (String(text || '').match(/\d[\d,]*\s?[.,]\s?\d\d(?!\d)/g) || []).map(x => parseFloat(x.replace(/\s/g, '').replace(/,(?=\d{3})/g, '').replace(',', '.')));
   return !money.some(v => v > 0);
@@ -126,7 +129,8 @@ function prepareImage(src, fallbackBuf) {
     if (W * H > 6e6) return fallbackBuf;
     const g = new Float32Array(w * h);
     for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
-    const out = new PNG({ width: W, height: H });
+    // ⚡ เขียนเป็น PNG ขาวดำ 1 ช่องสี + บีบอัดเบา ๆ (เร็วกว่า RGBA บีบอัดเต็มหลายเท่า)
+    const outBuf = Buffer.alloc(W * H);
     if (scale < 0.75) {
       // ย่อมาก: เฉลี่ยพิกเซลเป็นบล็อก (คมกว่าเลือกจุด)
       const inv = 1 / scale;
@@ -136,22 +140,19 @@ function prepareImage(src, fallbackBuf) {
           const sx0 = Math.floor(x * inv), sx1 = Math.min(w, Math.floor((x + 1) * inv));
           let sum = 0, n = 0;
           for (let yy = sy0; yy < sy1; yy++) for (let xx = sx0; xx < sx1; xx++) { sum += g[yy * w + xx]; n++; }
-          const k = (y * W + x) * 4;
-          out.data[k] = out.data[k + 1] = out.data[k + 2] = n ? sum / n : 255; out.data[k + 3] = 255;
+          outBuf[y * W + x] = n ? sum / n : 255;
         }
       }
-      return PNG.sync.write(out);
-    }
-    for (let y = 0; y < H; y++) {
-      const fy = Math.min(h - 1, (y + 0.5) / scale - 0.5), y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(h - 1, y0 + 1), ty = Math.max(0, fy - y0);
-      for (let x = 0; x < W; x++) {
-        const fx = Math.min(w - 1, (x + 0.5) / scale - 0.5), x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(w - 1, x0 + 1), tx = Math.max(0, fx - x0);
-        const v = (g[y0 * w + x0] * (1 - tx) + g[y0 * w + x1] * tx) * (1 - ty) + (g[y1 * w + x0] * (1 - tx) + g[y1 * w + x1] * tx) * ty;
-        const k = (y * W + x) * 4;
-        out.data[k] = out.data[k + 1] = out.data[k + 2] = v; out.data[k + 3] = 255;
+    } else {
+      for (let y = 0; y < H; y++) {
+        const fy = Math.min(h - 1, (y + 0.5) / scale - 0.5), y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(h - 1, y0 + 1), ty = Math.max(0, fy - y0);
+        for (let x = 0; x < W; x++) {
+          const fx = Math.min(w - 1, (x + 0.5) / scale - 0.5), x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(w - 1, x0 + 1), tx = Math.max(0, fx - x0);
+          outBuf[y * W + x] = (g[y0 * w + x0] * (1 - tx) + g[y0 * w + x1] * tx) * (1 - ty) + (g[y1 * w + x0] * (1 - tx) + g[y1 * w + x1] * tx) * ty;
+        }
       }
     }
-    return PNG.sync.write(out);
+    return PNG.sync.write({ width: W, height: H, data: outBuf }, { colorType: 0, inputColorType: 0, inputHasAlpha: false, bitDepth: 8, deflateLevel: 1 });
   } catch (e) { console.error('⚠️ [OCR] เตรียมรูปไม่สำเร็จ ใช้รูปเดิม:', e.message); return fallbackBuf; }
 }
 
@@ -205,16 +206,21 @@ function findSlipQr(img) {
   const W = img.width, H = img.height;
   const big = Math.max(W, H);
   const fit = (n) => Math.min(3, Math.max(0.4, n / big));
+  // ⚡ เริ่มจากจุดที่ QR สลิปอยู่บ่อย (ขวาล่าง / ขวาบน) ขนาดจริง -> เล็กกว่าทั้งรูป อ่านเร็วกว่ามาก
+  const up = (n) => Math.min(3, Math.max(1, n / big)); // รูปเล็กมาก -> ขยาย
   const tries = [
-    [0, 0, W, H, fit(900)], [0, 0, W, H, fit(1400)],
-    [0, H * 0.4, W, H * 0.6, fit(1800)], [W * 0.4, H * 0.4, W * 0.6, H * 0.6, fit(2000)],
-    [0, H * 0.5, W * 0.6, H * 0.5, fit(2000)], [0, 0, W, H, fit(2400)]
+    [W * 0.45, H * 0.4, W * 0.55, H * 0.6, up(700), 'dontInvert'],   // ขวาล่าง (กสิกร / SCB / ttb / กรุงเทพ / กรุงศรี / ธ.ก.ส.)
+    [W * 0.55, 0, W * 0.45, H * 0.4, up(700), 'dontInvert'],         // ขวาบน (กรุงไทย)
+    [0, 0, W, H, Math.min(1, fit(1100)), 'dontInvert'],
+    [0, 0, W, H, fit(1600), 'attemptBoth'],
+    [0, H * 0.4, W, H * 0.6, fit(2000), 'attemptBoth'],
+    [0, 0, W, H, fit(2400), 'attemptBoth']
   ];
-  for (const [x, y, w, h, s] of tries) {
+  for (const [x, y, w, h, s, inv] of tries) {
     const part = scaleCrop(img, x, y, w, h, s);
     if (!part) continue;
     let code = null;
-    try { code = jsQR(part.data, part.width, part.height, { inversionAttempts: 'attemptBoth' }); } catch (e) {}
+    try { code = jsQR(part.data, part.width, part.height, { inversionAttempts: inv }); } catch (e) {}
     const p = code && parseSlipQr(code.data);
     if (p) return p;
   }

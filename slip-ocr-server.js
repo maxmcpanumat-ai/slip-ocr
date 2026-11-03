@@ -119,13 +119,29 @@ function prepareImage(src, fallbackBuf) {
   if (!src) return fallbackBuf;
   try {
     const w = src.width, h = src.height, d = src.data;
-    const TARGET = Number(process.env.OCR_TARGET_WIDTH) || 1300;
-    const scale = Math.min(3, Math.max(1, TARGET / w));
+    // ⚡ ความกว้างเป้าหมาย: รูปเล็กขยายขึ้น · รูปใหญ่ย่อลง (Render ฟรีมี CPU น้อย ยิ่งพิกเซลมากยิ่งช้า)
+    const TARGET = Number(process.env.OCR_TARGET_WIDTH) || 1000;
+    const scale = Math.min(3, TARGET / w);
     const W = Math.round(w * scale), H = Math.round(h * scale);
     if (W * H > 6e6) return fallbackBuf;
     const g = new Float32Array(w * h);
     for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
     const out = new PNG({ width: W, height: H });
+    if (scale < 0.75) {
+      // ย่อมาก: เฉลี่ยพิกเซลเป็นบล็อก (คมกว่าเลือกจุด)
+      const inv = 1 / scale;
+      for (let y = 0; y < H; y++) {
+        const sy0 = Math.floor(y * inv), sy1 = Math.min(h, Math.floor((y + 1) * inv));
+        for (let x = 0; x < W; x++) {
+          const sx0 = Math.floor(x * inv), sx1 = Math.min(w, Math.floor((x + 1) * inv));
+          let sum = 0, n = 0;
+          for (let yy = sy0; yy < sy1; yy++) for (let xx = sx0; xx < sx1; xx++) { sum += g[yy * w + xx]; n++; }
+          const k = (y * W + x) * 4;
+          out.data[k] = out.data[k + 1] = out.data[k + 2] = n ? sum / n : 255; out.data[k + 3] = 255;
+        }
+      }
+      return PNG.sync.write(out);
+    }
     for (let y = 0; y < H; y++) {
       const fy = Math.min(h - 1, (y + 0.5) / scale - 0.5), y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(h - 1, y0 + 1), ty = Math.max(0, fy - y0);
       for (let x = 0; x < W; x++) {
@@ -190,7 +206,7 @@ function findSlipQr(img) {
   const big = Math.max(W, H);
   const fit = (n) => Math.min(3, Math.max(0.4, n / big));
   const tries = [
-    [0, 0, W, H, fit(1400)], [0, 0, W, H, fit(900)],
+    [0, 0, W, H, fit(900)], [0, 0, W, H, fit(1400)],
     [0, H * 0.4, W, H * 0.6, fit(1800)], [W * 0.4, H * 0.4, W * 0.6, H * 0.6, fit(2000)],
     [0, H * 0.5, W * 0.6, H * 0.5, fit(2000)], [0, 0, W, H, fit(2400)]
   ];
@@ -228,12 +244,16 @@ app.post('/ocr', async (req, res) => {
   const t0 = Date.now();
   try {
     const out = await runQueued(async () => {
+      const T = { s: Date.now() };
       let rgba = decodeRGBA(buf, type);
       const qr = findSlipQr(rgba);
+      T.qr = Date.now();
       const img = prepareImage(rgba, buf);
       rgba = null;
       const main = await getMain();
+      T.prep = Date.now();
       const r1 = await main.recognize(img);
+      T.ocr = Date.now();
       const text = String(r1.data.text || '');
       let textEng = '';
       if (ENG_PASS && needEngPass(text)) {
@@ -243,10 +263,12 @@ app.post('/ocr', async (req, res) => {
       } else {
         await recycleIfHeavy();
       }
-      return { text, textEng, qr, confidence: Math.round(Number(r1.data.confidence) || 0) };
+      T.end = Date.now();
+      const timing = 'QR ' + (T.qr - T.s) + ' · เตรียมรูป ' + (T.prep - T.qr) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
+      return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
     });
     const ms = Date.now() - t0;
-    console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (ความมั่นใจ ' + out.confidence + '%' + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ')');
+    console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (ความมั่นใจ ' + out.confidence + '%' + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ') [' + out.timing + ']');
     res.json({ success: true, ...out, ms });
   } catch (e) {
     console.error('❌ [OCR] อ่านไม่สำเร็จ:', e.message || e);

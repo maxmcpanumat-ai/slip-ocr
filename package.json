@@ -13,6 +13,7 @@
   "dependencies": {
     "express": "^4.21.2",
     "jpeg-js": "^0.4.4",
+    "jsqr": "^1.4.0",
     "pngjs": "^7.0.0",
     "tesseract.js": "^7.0.0"
   }

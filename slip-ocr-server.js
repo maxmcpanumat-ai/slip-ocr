@@ -181,7 +181,7 @@ function parseSlipQr(text) {
   if (!/^00\d{2}/.test(t) || t.length < 20 || t.length > 200) return null;
   const top = parseTlv(t);
   const sub = top && top['00'] ? parseTlv(top['00']) : null;
-  if (!sub || !sub['02'] || !/^[A-Za-z0-9]{8,40}$/.test(sub['02'].trim())) return null;
+  if (!sub || !sub['02'] || !/^[A-Za-z0-9][A-Za-z0-9\-]{7,44}$/.test(sub['02'].trim())) return null; // UOB มีขีด เช่น 2611036428481645-TFR
   return { bank: /^\d{3}$/.test(sub['01'] || '') ? sub['01'] : '', transRef: sub['02'].trim(), crcOk: top['91'] ? crc16(t.slice(0, -4)) === String(top['91']).toUpperCase() : null };
 }
 function scaleCrop(img, x0, y0, w, h, s) {
@@ -211,10 +211,12 @@ function findSlipQr(img) {
   const tries = [
     [W * 0.45, H * 0.4, W * 0.55, H * 0.6, up(700), 'dontInvert'],   // ขวาล่าง (กสิกร / SCB / ttb / กรุงเทพ / กรุงศรี / ธ.ก.ส.)
     [W * 0.55, 0, W * 0.45, H * 0.4, up(700), 'dontInvert'],         // ขวาบน (กรุงไทย)
+    [0, H * 0.55, W, H * 0.45, up(700), 'dontInvert'],               // แถบล่างทั้งแถบ (UOB อยู่ซ้ายล่าง)
     [0, 0, W, H, Math.min(1, fit(1100)), 'dontInvert'],
     [0, 0, W, H, fit(1600), 'attemptBoth'],
     [0, H * 0.4, W, H * 0.6, fit(2000), 'attemptBoth'],
-    [0, 0, W, H, fit(2400), 'attemptBoth']
+    [0, 0, W, H, fit(2400), 'attemptBoth'],
+    [0, H * 0.55, W * 0.5, H * 0.45, up(1000), 'attemptBoth']
   ];
   for (const [x, y, w, h, s, inv] of tries) {
     const part = scaleCrop(img, x, y, w, h, s);

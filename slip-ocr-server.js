@@ -72,7 +72,13 @@ function needEngPass(text) {
   const shortTo = /(ไปยัง|ไปที่)[\s\S]{0,120}?(?<![A-Za-z0-9])[xX*%]{1,8}-?\d{4}(?!\d)/.test(String(text || ''));
   if (new Set(acc.map(a => a.replace(/[^0-9]/g, ''))).size < 2 && !shortTo) return true;
   // ไม่เจอยอดเงิน (x.xx ที่มากกว่า 0 · ค่าธรรมเนียม 0.00 ไม่นับ) -> อ่านรอบ 2 ช่วยหายอด
-  const money = (String(text || '').match(/\d[\d,]*\s?[.,]\s?\d\d(?!\d)/g) || []).map(x => parseFloat(x.replace(/\s/g, '').replace(/,(?=\d{3})/g, '').replace(',', '.')));
+  // ไม่นับบรรทัดวันเวลา (เช่น "4 พ.ย. 69, 07:20 น.") · ยอดเงินต้องมีจุดทศนิยม (x.xx)
+  const money = [];
+  for (const l of String(text || '').split('\n')) {
+    if (/\d{1,2}:\d{2}/.test(l) && !/บาท|THB|฿/i.test(l)) continue;
+    if (/ค่าธรรมเนียม|ธรรมเนียม/.test(l)) continue;
+    for (const x of l.match(/\d[\d,]*\s?\.\s?\d\d(?!\d)/g) || []) money.push(parseFloat(x.replace(/[\s,]/g, '')));
+  }
   return !money.some(v => v > 0);
 }
 async function recycleIfHeavy() {

@@ -93,7 +93,17 @@ async function engPass(img) {
   return String((await recognizeSafe(w, img, 'eng')).data.text || '');
 }
 // รอบ 1 อ่านเลขบัญชีที่ปิดบางหลักได้ครบ 2 เลข (ผู้โอน + ผู้รับ) แล้ว -> ไม่ต้องอ่านรอบ 2
+// คำที่พบในสลิปโอนเงิน (ครอบคลุมคำที่บอทใช้ตัดสินว่า "ดูเหมือนสลิป" ทั้งหมด)
+// ไม่มีคำเหล่านี้เลย + ไม่มีตัวเลขแบบยอดเงิน = ไม่ใช่สลิป (รูปพระ / รูปสินค้า / ที่อยู่ / แชท)
+const SLIP_WORDS = /โอน|สำเร็จ|สําเร็จ|จำนวน|จํานวน|ยอดเงิน|บาท|THB|ธนาคาร|ธ\.|รายการ|อ้างอิง|ธรรมเนียม|ผู้รับ|ไปยัง|ไปที่|ชำระ|ชําระ|พร้อมเพย์|เป๋าตัง|กสิกร|ไทยพาณิชย์|กรุงไทย|กรุงเทพ|กรุงศรี|ทีทีบี|ทหารไทย|ออมสิน|อาคารสงเคราะห์|ยูโอบี|ซีไอเอ็มบี|เกียรตินาคิน|แลนด์|ทิสโก้|Bank|Transfer|Success|Amount|Ref|PromptPay|K\s*PLUS|K\+|SCB|Krungthai|Krungsri|ttb|GSB|BAAC|UOB|TISCO|CIMB|KKP|kbank|MyMo|Wallet|Paotang/i;
+const MONEY_LIKE = /\d[\d,]*\s?[.,]\s?\d{2}(?!\d)|\d\s*(um|vm|ym|uw|wm|un|wn)(?![a-z])/i;
+function looksLikeSlipText(t) {
+  const x = String(t || '').replace(/ํา/g, 'ำ');
+  return SLIP_WORDS.test(x) || MONEY_LIKE.test(x);
+}
 function needEngPass(text) {
+  // ข้อความไม่มีคำที่พบในสลิปเลย -> ไม่ต้องอ่านรอบ 2 (ประหยัด ~5-7 วิ บน Render ฟรี)
+  if (!SLIP_WORDS.test(String(text || '').replace(/ํา/g, 'ำ'))) return false;
   const acc = (String(text || '').match(/(?<![A-Za-z0-9])[xX*%\d](?:[xX*%\d\- ]{5,20})[xX*%\d](?![A-Za-z0-9])/g) || [])
     .filter(x => (x.match(/\d/g) || []).length >= 3 && /[xX*%]/.test(x) && x.replace(/[^0-9xX*%]/g, '').length >= 9);
   // บัญชีผู้รับแบบสั้นหลังคำว่า ไปยัง (SCB: "x-0129") ถือว่าอ่านได้แล้ว
@@ -153,12 +163,15 @@ function decodeRGBA(buf, type) {
 }
 
 // 🔍 เตรียมรูปก่อนอ่าน: ขาวดำ + ขยายรูปเล็ก (สลิปที่ส่งผ่าน Messenger มักถูกย่อ ตัวหนังสือเล็ก อ่านพลาดง่าย)
-function prepareImage(src, fallbackBuf) {
+const OCR_TARGET_WIDTH = Number(process.env.OCR_TARGET_WIDTH) || 1000;
+const QUICK_WIDTH = Number(process.env.OCR_QUICK_WIDTH) || 560;     // ความกว้างรูปตอนเช็กเร็วว่าเป็นสลิปไหม
+const QUICK_CHECK = process.env.OCR_QUICK_CHECK !== '0';            // ปิดได้ด้วย OCR_QUICK_CHECK=0
+function prepareImage(src, fallbackBuf, targetWidth) {
   if (!src) return fallbackBuf;
   try {
     const w = src.width, h = src.height, d = src.data;
     // ⚡ ความกว้างเป้าหมาย: รูปเล็กขยายขึ้น · รูปใหญ่ย่อลง (Render ฟรีมี CPU น้อย ยิ่งพิกเซลมากยิ่งช้า)
-    const TARGET = Number(process.env.OCR_TARGET_WIDTH) || 1000;
+    const TARGET = targetWidth || OCR_TARGET_WIDTH;
     const scale = Math.min(3, TARGET / w);
     const W = Math.round(w * scale), H = Math.round(h * scale);
     if (W * H > 6e6) return fallbackBuf;
@@ -285,16 +298,16 @@ function findSlipQr(img) {
     const p = code && parseSlipQr(code.data);
     if (p) return p;
   }
-  // 🔎 รูปเล็ก (QR แค่ไม่กี่สิบพิกเซล) -> ขยายแบบเกลี่ยสี 2-4 เท่า แล้วลองใหม่ (ทำเฉพาะเมื่อวิธีปกติหาไม่เจอ)
-  if (big < 1600) {
+  // 🔎 รูปเล็ก (QR แค่ไม่กี่สิบพิกเซล เช่น แคปจอ/ส่งต่อ) -> ขยายแบบเกลี่ยสีแล้วลองใหม่ (ทำเฉพาะรูปเล็กที่วิธีปกติหาไม่เจอ)
+  // รูปใหญ่ไม่ทำ (QR ใหญ่พออยู่แล้ว) -> รูปที่ไม่ใช่สลิป (รูปพระ/สินค้า) ไม่เสียเวลาเพิ่ม
+  if (big < 1000) {
     const smooth = [
       [W * 0.45, H * 0.4, W * 0.55, H * 0.6],   // ขวาล่าง
       [W * 0.55, 0, W * 0.45, H * 0.45],        // ขวาบน
-      [0, H * 0.5, W, H * 0.5],                 // ครึ่งล่าง
-      [0, 0, W, H]
+      [0, H * 0.5, W, H * 0.5]                  // ครึ่งล่าง
     ];
     for (const [x, y, w, h] of smooth) {
-      for (const want of [900, 1300]) {
+      for (const want of [900]) {
         const s = Math.min(4, Math.max(1.5, want / Math.max(w, h)));
         const part = scaleCropSmooth(img, x, y, w, h, s);
         if (!part) continue;
@@ -339,9 +352,27 @@ app.post('/ocr', async (req, res) => {
       let rgba = decodeRGBA(buf, type);
       const qr = findSlipQr(rgba);
       T.qr = Date.now();
+      const main = await getMain();
+      // ⚡ ไม่พบ QR -> อ่านเร็ว ๆ จากรูปย่อก่อน (ราว 1/3 ของเวลาอ่านเต็ม)
+      // ไม่มีคำที่พบในสลิปเลย = ไม่ใช่สลิป (รูปพระ/สินค้า/ที่อยู่) -> หยุดเลย ไม่อ่านเต็ม ไม่ให้คิวช้า
+      // สลิปที่มี QR (เกือบทั้งหมด) ไม่ผ่านขั้นนี้ -> เร็วเท่าเดิม
+      if (!qr && QUICK_CHECK && rgba) {
+        const fullW = Math.round(rgba.width * Math.min(3, OCR_TARGET_WIDTH / rgba.width));
+        if (fullW > QUICK_WIDTH * 1.25) {
+          const small = prepareImage(rgba, buf, QUICK_WIDTH);
+          const rq = await recognizeSafe(main, small, 'main');
+          T.quick = Date.now();
+          const qt = String(rq.data.text || '');
+          if (!looksLikeSlipText(qt)) {
+            await recycleIfHeavy();
+            return { text: qt.trim() ? qt : '(ไม่พบข้อความในรูป)', textEng: '', qr: null, notSlip: true, confidence: Math.round(Number(rq.data.confidence) || 0),
+              timing: 'QR ' + (T.qr - T.s) + ' · เช็กสลิป ' + (T.quick - T.qr) + ' ms · ไม่ใช่สลิป ข้ามการอ่านเต็ม' };
+          }
+        }
+      }
+      const tPrep0 = Date.now();
       const img = prepareImage(rgba, buf);
       rgba = null;
-      const main = await getMain();
       T.prep = Date.now();
       const r1 = await recognizeSafe(main, img, 'main');
       T.ocr = Date.now();
@@ -352,11 +383,11 @@ app.post('/ocr', async (req, res) => {
       }
       await recycleIfHeavy();
       T.end = Date.now();
-      const timing = 'QR ' + (T.qr - T.s) + ' · เตรียมรูป ' + (T.prep - T.qr) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
+      const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
       return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
     });
     const ms = Date.now() - t0;
-    console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (ความมั่นใจ ' + out.confidence + '%' + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ') [' + out.timing + ']');
+    console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (' + (out.notSlip ? 'ไม่ใช่สลิป' : 'ความมั่นใจ ' + out.confidence + '%') + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ') [' + out.timing + ']');
     res.json({ success: true, ...out, ms });
   } catch (e) {
     if (e && e.gone) { console.log('⏭️ [OCR] ข้ามรูปที่บอทเลิกรอแล้ว (รอคิว ' + Math.round((Date.now() - t0) / 1000) + ' วิ)'); return; }

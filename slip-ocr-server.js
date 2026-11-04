@@ -164,7 +164,7 @@ function decodeRGBA(buf, type) {
 
 // 🔍 เตรียมรูปก่อนอ่าน: ขาวดำ + ขยายรูปเล็ก (สลิปที่ส่งผ่าน Messenger มักถูกย่อ ตัวหนังสือเล็ก อ่านพลาดง่าย)
 const OCR_TARGET_WIDTH = Number(process.env.OCR_TARGET_WIDTH) || 1000;
-const QUICK_WIDTH = Number(process.env.OCR_QUICK_WIDTH) || 560;     // ความกว้างรูปตอนเช็กเร็วว่าเป็นสลิปไหม
+const QUICK_WIDTH = Number(process.env.OCR_QUICK_WIDTH) || 480;     // ความกว้างรูปตอนเช็กเร็วว่าเป็นสลิปไหม
 const QUICK_CHECK = process.env.OCR_QUICK_CHECK !== '0';            // ปิดได้ด้วย OCR_QUICK_CHECK=0
 function prepareImage(src, fallbackBuf, targetWidth) {
   if (!src) return fallbackBuf;
@@ -270,7 +270,8 @@ function scaleCropSmooth(img, x0, y0, w, h, s) {
   }
   return { data: o, width: W, height: H };
 }
-function findSlipQr(img) {
+// phase 1 = จุดที่ QR สลิปอยู่บ่อย (เร็ว เจอเกือบทุกธนาคาร) · phase 2 = ลองละเอียด (ช้า ใช้เมื่อรู้แล้วว่าน่าจะเป็นสลิป)
+function findSlipQr(img, phase) {
   if (!jsQR || !img) return null;
   const W = img.width, H = img.height;
   const big = Math.max(W, H);
@@ -290,7 +291,8 @@ function findSlipQr(img) {
     [0, 0, W, H, fit(2400), 'attemptBoth'],
     [0, H * 0.55, W * 0.5, H * 0.45, up(1000), 'attemptBoth']
   ];
-  for (const [x, y, w, h, s, inv] of tries) {
+  const list = phase === 1 ? tries.slice(0, 3) : phase === 2 ? tries.slice(3) : tries;
+  for (const [x, y, w, h, s, inv] of list) {
     const part = scaleCrop(img, x, y, w, h, s);
     if (!part) continue;
     let code = null;
@@ -300,7 +302,7 @@ function findSlipQr(img) {
   }
   // 🔎 รูปเล็ก (QR แค่ไม่กี่สิบพิกเซล เช่น แคปจอ/ส่งต่อ) -> ขยายแบบเกลี่ยสีแล้วลองใหม่ (ทำเฉพาะรูปเล็กที่วิธีปกติหาไม่เจอ)
   // รูปใหญ่ไม่ทำ (QR ใหญ่พออยู่แล้ว) -> รูปที่ไม่ใช่สลิป (รูปพระ/สินค้า) ไม่เสียเวลาเพิ่ม
-  if (big < 1000) {
+  if (phase !== 1 && big < 1000) {
     const smooth = [
       [W * 0.45, H * 0.4, W * 0.55, H * 0.6],   // ขวาล่าง
       [W * 0.55, 0, W * 0.45, H * 0.45],        // ขวาบน
@@ -350,7 +352,10 @@ app.post('/ocr', async (req, res) => {
       if (gone) { const err = new Error('CLIENT_GONE'); err.gone = true; throw err; }
       const T = { s: Date.now() };
       let rgba = decodeRGBA(buf, type);
-      const qr = findSlipQr(rgba);
+      // ⚡ หา QR จุดที่เจอบ่อยก่อน (เร็ว) · ยังไม่เจอ -> เช็กก่อนว่าเป็นสลิปไหม ค่อยหาละเอียด (ช้า)
+      let qr = findSlipQr(rgba, 1);
+      // รูปเล็ก (เช่น แคปจอย่อ) หา QR แบบละเอียดได้เร็ว -> ทำเลย
+      if (!qr && rgba && Math.max(rgba.width, rgba.height) < 1000) { qr = findSlipQr(rgba, 2); T.qrSmallDone = true; }
       T.qr = Date.now();
       const main = await getMain();
       // ⚡ ไม่พบ QR -> อ่านเร็ว ๆ จากรูปย่อก่อน (ราว 1/3 ของเวลาอ่านเต็ม)
@@ -364,12 +369,15 @@ app.post('/ocr', async (req, res) => {
           T.quick = Date.now();
           const qt = String(rq.data.text || '');
           if (!looksLikeSlipText(qt)) {
+            T.qr2 = 0;
             await recycleIfHeavy();
             return { text: qt.trim() ? qt : '(ไม่พบข้อความในรูป)', textEng: '', qr: null, notSlip: true, confidence: Math.round(Number(rq.data.confidence) || 0),
               timing: 'QR ' + (T.qr - T.s) + ' · เช็กสลิป ' + (T.quick - T.qr) + ' ms · ไม่ใช่สลิป ข้ามการอ่านเต็ม' };
           }
         }
       }
+      // น่าจะเป็นสลิป (หรือรูปเล็กที่ไม่ได้เช็กเร็ว) -> หา QR แบบละเอียดต่อ
+      if (!qr && !T.qrSmallDone) { const tq = Date.now(); qr = findSlipQr(rgba, 2); T.qr2 = Date.now() - tq; }
       const tPrep0 = Date.now();
       const img = prepareImage(rgba, buf);
       rgba = null;
@@ -383,7 +391,7 @@ app.post('/ocr', async (req, res) => {
       }
       await recycleIfHeavy();
       T.end = Date.now();
-      const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
+      const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
       return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
     });
     const ms = Date.now() - t0;

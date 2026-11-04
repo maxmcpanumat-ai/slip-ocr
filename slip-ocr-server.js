@@ -74,9 +74,23 @@ async function closeEng() {
   engP = null;
   if (p) { try { await (await p).terminate(); } catch (e) {} }
 }
+// ⏱️ กันตัวอ่านค้าง: อ่านรูปเดียวนานเกินกำหนด -> ปิดตัวอ่านแล้วเปิดใหม่ (ไม่ให้คิวทั้งหมดค้างตาม)
+const RECOG_TIMEOUT = Number(process.env.OCR_JOB_TIMEOUT_MS) || 100000;
+async function recognizeSafe(w, img, which) {
+  let timer;
+  try {
+    return await Promise.race([w.recognize(img), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('OCR_STUCK')), RECOG_TIMEOUT); })]);
+  } catch (e) {
+    if (e && e.message === 'OCR_STUCK') {
+      console.error('⏱️ [OCR] ตัวอ่าน' + (which === 'eng' ? 'รอบ 2' : '') + 'ค้างเกิน ' + Math.round(RECOG_TIMEOUT / 1000) + ' วิ -> เปิดใหม่');
+      if (which === 'eng') await closeEng(); else await closeMain();
+    }
+    throw e;
+  } finally { clearTimeout(timer); }
+}
 async function engPass(img) {
   const w = await getEng();
-  return String((await w.recognize(img)).data.text || '');
+  return String((await recognizeSafe(w, img, 'eng')).data.text || '');
 }
 // รอบ 1 อ่านเลขบัญชีที่ปิดบางหลักได้ครบ 2 เลข (ผู้โอน + ผู้รับ) แล้ว -> ไม่ต้องอ่านรอบ 2
 function needEngPass(text) {
@@ -222,6 +236,27 @@ function scaleCrop(img, x0, y0, w, h, s) {
   }
   return { data: o, width: W, height: H };
 }
+// ขยายแบบเกลี่ยสี (bilinear) -> QR ในรูปเล็ก/ถูกย่อ (ลูกค้าส่งต่อ / แคปหน้าจอ) อ่านได้ ขยายแบบจุดต่อจุดอ่านไม่ออก
+function scaleCropSmooth(img, x0, y0, w, h, s) {
+  x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+  w = Math.min(img.width - x0, Math.floor(w)); h = Math.min(img.height - y0, Math.floor(h));
+  if (w < 20 || h < 20) return null;
+  const W = Math.round(w * s), H = Math.round(h * s);
+  if (W * H > 4e6) return null;
+  const src = img.data, iw = img.width;
+  const g = (x, y) => { const i = (y * iw + x) * 4; return (src[i] * 77 + src[i + 1] * 150 + src[i + 2] * 29) >> 8; };
+  const o = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    const fy = Math.min(h - 1.001, Math.max(0, (y + 0.5) / s - 0.5)), iy = Math.floor(fy), dy = fy - iy;
+    for (let x = 0; x < W; x++) {
+      const fx = Math.min(w - 1.001, Math.max(0, (x + 0.5) / s - 0.5)), ix = Math.floor(fx), dx = fx - ix;
+      const ax = x0 + ix, ay = y0 + iy;
+      const v = g(ax, ay) * (1 - dx) * (1 - dy) + g(ax + 1, ay) * dx * (1 - dy) + g(ax, ay + 1) * (1 - dx) * dy + g(ax + 1, ay + 1) * dx * dy;
+      const di = (y * W + x) * 4; o[di] = o[di + 1] = o[di + 2] = v; o[di + 3] = 255;
+    }
+  }
+  return { data: o, width: W, height: H };
+}
 function findSlipQr(img) {
   if (!jsQR || !img) return null;
   const W = img.width, H = img.height;
@@ -250,6 +285,26 @@ function findSlipQr(img) {
     const p = code && parseSlipQr(code.data);
     if (p) return p;
   }
+  // 🔎 รูปเล็ก (QR แค่ไม่กี่สิบพิกเซล) -> ขยายแบบเกลี่ยสี 2-4 เท่า แล้วลองใหม่ (ทำเฉพาะเมื่อวิธีปกติหาไม่เจอ)
+  if (big < 1600) {
+    const smooth = [
+      [W * 0.45, H * 0.4, W * 0.55, H * 0.6],   // ขวาล่าง
+      [W * 0.55, 0, W * 0.45, H * 0.45],        // ขวาบน
+      [0, H * 0.5, W, H * 0.5],                 // ครึ่งล่าง
+      [0, 0, W, H]
+    ];
+    for (const [x, y, w, h] of smooth) {
+      for (const want of [900, 1300]) {
+        const s = Math.min(4, Math.max(1.5, want / Math.max(w, h)));
+        const part = scaleCropSmooth(img, x, y, w, h, s);
+        if (!part) continue;
+        let code = null;
+        try { code = jsQR(part.data, part.width, part.height, { inversionAttempts: 'dontInvert' }); } catch (e) {}
+        const p = code && parseSlipQr(code.data);
+        if (p) return p;
+      }
+    }
+  }
   return null;
 }
 
@@ -274,8 +329,12 @@ app.post('/ocr', async (req, res) => {
   if (!type) return res.status(415).json({ success: false, error: 'IMAGE_FORMAT_UNSUPPORTED' });
   if (pending >= MAX_QUEUE) return res.status(503).json({ success: false, error: 'BUSY' });
   const t0 = Date.now();
+  // บอทเลิกรอแล้ว (หมดเวลา/ตัดการเชื่อมต่อ) -> ไม่ต้องอ่านรูปนี้ ไม่ให้คิวยาวโดยเปล่าประโยชน์
+  let gone = false;
+  res.on('close', () => { if (!res.writableFinished) gone = true; });
   try {
     const out = await runQueued(async () => {
+      if (gone) { const err = new Error('CLIENT_GONE'); err.gone = true; throw err; }
       const T = { s: Date.now() };
       let rgba = decodeRGBA(buf, type);
       const qr = findSlipQr(rgba);
@@ -284,7 +343,7 @@ app.post('/ocr', async (req, res) => {
       rgba = null;
       const main = await getMain();
       T.prep = Date.now();
-      const r1 = await main.recognize(img);
+      const r1 = await recognizeSafe(main, img, 'main');
       T.ocr = Date.now();
       const text = String(r1.data.text || '');
       let textEng = '';
@@ -300,6 +359,7 @@ app.post('/ocr', async (req, res) => {
     console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (ความมั่นใจ ' + out.confidence + '%' + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ') [' + out.timing + ']');
     res.json({ success: true, ...out, ms });
   } catch (e) {
+    if (e && e.gone) { console.log('⏭️ [OCR] ข้ามรูปที่บอทเลิกรอแล้ว (รอคิว ' + Math.round((Date.now() - t0) / 1000) + ' วิ)'); return; }
     console.error('❌ [OCR] อ่านไม่สำเร็จ:', e.message || e);
     res.status(500).json({ success: false, error: 'OCR_FAILED', detail: String(e.message || e).slice(0, 200) });
   }

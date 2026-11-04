@@ -57,12 +57,26 @@ async function closeMain() {
   mainP = null;
   if (p) { try { await (await p).terminate(); } catch (e) {} }
 }
+// ⚡ ตัวอ่านรอบ 2 เปิดค้างไว้ใช้ซ้ำ (เดิมเปิด-ปิดทุกครั้ง เสีย CPU โหลดภาษาใหม่ทุกรอบ) · แรมเกินกำหนดค่อยปิดคืนแรม
+let engP = null;
+function getEng() {
+  if (!engP) {
+    engP = (async () => {
+      const w = await createWorker(['eng'], 1, workerOpts());
+      await w.setParameters({ tessedit_pageseg_mode: '11' });
+      return w;
+    })().catch(e => { engP = null; throw e; });
+  }
+  return engP;
+}
+async function closeEng() {
+  const p = engP;
+  engP = null;
+  if (p) { try { await (await p).terminate(); } catch (e) {} }
+}
 async function engPass(img) {
-  const w = await createWorker(['eng'], 1, workerOpts());
-  try {
-    await w.setParameters({ tessedit_pageseg_mode: '11' });
-    return String((await w.recognize(img)).data.text || '');
-  } finally { try { await w.terminate(); } catch (e) {} }
+  const w = await getEng();
+  return String((await w.recognize(img)).data.text || '');
 }
 // รอบ 1 อ่านเลขบัญชีที่ปิดบางหลักได้ครบ 2 เลข (ผู้โอน + ผู้รับ) แล้ว -> ไม่ต้องอ่านรอบ 2
 function needEngPass(text) {
@@ -84,6 +98,7 @@ function needEngPass(text) {
 async function recycleIfHeavy() {
   const rss = Math.round(process.memoryUsage().rss / 1048576);
   if (rss < RECYCLE_MB) return;
+  await closeEng();
   await closeMain();
   console.log('♻️ [OCR] แรม ' + rss + ' MB เกิน ' + RECYCLE_MB + ' MB -> เปิดตัวอ่านใหม่');
 }
@@ -214,10 +229,13 @@ function findSlipQr(img) {
   const fit = (n) => Math.min(3, Math.max(0.4, n / big));
   // ⚡ เริ่มจากจุดที่ QR สลิปอยู่บ่อย (ขวาล่าง / ขวาบน) ขนาดจริง -> เล็กกว่าทั้งรูป อ่านเร็วกว่ามาก
   const up = (n) => Math.min(3, Math.max(1, n / big)); // รูปเล็กมาก -> ขยาย
+  // ⚡ ส่วนที่ตัดมาหา QR: รูปใหญ่ย่อให้ด้านยาวไม่เกิน ~800px (QR สลิปยังใหญ่พอ) · รูปเล็กขยายเหมือนเดิม
+  const cs = (w, h) => big < 700 ? up(700) : Math.max(0.5, Math.min(1, 800 / Math.max(w, h)));
   const tries = [
-    [W * 0.45, H * 0.4, W * 0.55, H * 0.6, up(700), 'dontInvert'],   // ขวาล่าง (กสิกร / SCB / ttb / กรุงเทพ / กรุงศรี / ธ.ก.ส.)
-    [W * 0.55, 0, W * 0.45, H * 0.4, up(700), 'dontInvert'],         // ขวาบน (กรุงไทย)
-    [0, H * 0.55, W, H * 0.45, up(700), 'dontInvert'],               // แถบล่างทั้งแถบ (UOB อยู่ซ้ายล่าง)
+    [W * 0.45, H * 0.4, W * 0.55, H * 0.6, cs(W * 0.55, H * 0.6), 'dontInvert'],   // ขวาล่าง (กสิกร / SCB / ttb / กรุงเทพ / กรุงศรี / ธ.ก.ส.)
+    [W * 0.55, 0, W * 0.45, H * 0.4, cs(W * 0.45, H * 0.4), 'dontInvert'],         // ขวาบน (กรุงไทย)
+    [0, H * 0.55, W, H * 0.45, cs(W, H * 0.45), 'dontInvert'],                     // แถบล่างทั้งแถบ (UOB อยู่ซ้ายล่าง)
+    [W * 0.45, H * 0.4, W * 0.55, H * 0.6, up(700), 'dontInvert'],                 // ขวาล่าง ขนาดเต็ม (เผื่อ QR เล็ก)
     [0, 0, W, H, Math.min(1, fit(1100)), 'dontInvert'],
     [0, 0, W, H, fit(1600), 'attemptBoth'],
     [0, H * 0.4, W, H * 0.6, fit(2000), 'attemptBoth'],
@@ -271,12 +289,9 @@ app.post('/ocr', async (req, res) => {
       const text = String(r1.data.text || '');
       let textEng = '';
       if (ENG_PASS && needEngPass(text)) {
-        await closeMain(); // คืนแรมของรอบ 1 ก่อน
         try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
-        getMain().catch(() => {}); // เปิดรอบ 1 รอไว้สำหรับรูปถัดไป
-      } else {
-        await recycleIfHeavy();
       }
+      await recycleIfHeavy();
       T.end = Date.now();
       const timing = 'QR ' + (T.qr - T.s) + ' · เตรียมรูป ' + (T.prep - T.qr) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
       return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };

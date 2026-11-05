@@ -119,6 +119,73 @@ function needEngPass(text) {
   }
   return !money.some(v => v > 0);
 }
+// ---------- 🔎 เช็กว่าเลขที่รายการใน QR ปรากฏในข้อความที่อ่านได้ไหม (เหมือนที่บอทใช้ตัดสิน) ----------
+// รูปเล็ก/ถูกบีบอัด ตัวอ่านภาษาไทยมักอ่านตัวอักษรอังกฤษในเลขที่รายการเพี้ยน (เช่น RXSWv9 -> ค6%ธเหง9)
+// -> บอทจะเข้าใจผิดว่า "เลขที่รายการไม่ตรงกับ QR" · กรณีนี้ให้อ่านรอบ 2 (อังกฤษ) ช่วย ซึ่งอ่านเลขอ้างอิงได้แม่นกว่า
+function refSkeleton(s, dropMarks) {
+  let x = String(s || '').replace(/[๐-๙]/g, d => String('๐๑๒๓๔๕๖๗๘๙'.indexOf(d))).replace(/b/g, '6').toUpperCase();
+  x = dropMarks ? x.replace(/[|)(\][!\/\\]/g, '') : x.replace(/[|)(\][!\/\\]/g, '1');
+  return x.replace(/[IL1]/g, '1').replace(/[O0QD]/g, '0').replace(/[S5]/g, '5')
+    .replace(/[B8]/g, '8').replace(/[Z2]/g, '2').replace(/[G6]/g, '6')
+    .replace(/[^0-9A-Z]/g, '');
+}
+// คืนค่า true ถ้าพบเลขที่รายการของ QR อยู่ในข้อความสลิป (ยอมให้อ่านผิด/ขาดได้เล็กน้อย)
+function slipRefFoundInText(qref, texts) {
+  const variants = [refSkeleton(qref, false), refSkeleton(qref, true)];
+  const q = variants[0];
+  if (q.length < 6) return true;
+  const need = Math.min(12, q.length);                       // ตรงกันติดกันอย่างน้อย 12 ตัว
+  const needTol = q.length >= 14 ? 12 : Math.max(8, q.length - 2); // หรือตรง 12 ตัว โดยผิดได้ไม่เกิน 2 ตัว
+  const K = 2;
+  for (const src of texts) {
+    if (!src) continue;
+    for (const drop of [false, true]) {
+      // แต่ละบรรทัดต่อกันเป็นสายเดียว (เลขที่ถูกตัดขึ้นบรรทัดใหม่จะต่อกันได้)
+      const t = refSkeleton(String(src).replace(/\s+/g, ''), drop);
+      const qq = drop ? variants[1] : variants[0];
+      if (!t || !qq) continue;
+      for (let d = -(qq.length - 1); d < t.length; d++) {
+        const i0 = Math.max(0, -d), i1 = Math.min(qq.length, t.length - d);
+        if (i1 - i0 < Math.min(need, needTol)) continue;
+        let lo = i0, mis = 0, match = 0, run = 0;
+        for (let i = i0; i < i1; i++) {
+          if (qq[i] === t[i + d]) {
+            match++; run++;
+            if (run >= need) return true;
+          } else {
+            run = 0; mis++;
+            while (mis > K) { if (qq[lo] !== t[lo + d]) mis--; else match--; lo++; }
+          }
+          if (match >= needTol) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+function refLooksMissing(qref, text) {
+  const toks = (String(text || '').match(/[A-Za-z0-9]{12,}/g) || []).filter(x => /\d{6,}/.test(x)).map(x => x.toUpperCase());
+  if (!toks.length) return false; // ไม่มีเลขยาว ๆ ให้เทียบ -> บอทไม่ตัดสินว่าไม่ตรงอยู่แล้ว
+  const norm = (x) => x.replace(/[IL]/g, '1').replace(/O/g, '0');
+  const q = String(qref || '').toUpperCase();
+  if (toks.some(x => x.length >= 10 && (norm(q).includes(norm(x)) || norm(x).includes(norm(q))))) return false;
+  if (Math.max(...toks.map(x => similarity(x, q))) >= 0.6) return false; // ใกล้เคียงพอ บอทถือว่าตรงอยู่แล้ว
+  return !slipRefFoundInText(q, [text]);
+}
+// ความเหมือนของข้อความ 0..1 (เหมือนในบอท)
+function similarity(a, b) {
+  a = String(a); b = String(b);
+  if (!a || !b) return 0;
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return 1 - prev[n] / Math.max(m, n);
+}
+
 async function recycleIfHeavy() {
   const rssMB = () => Math.round(process.memoryUsage().rss / 1048576);
   const rss = rssMB();
@@ -454,12 +521,17 @@ async function readSlipImage(buf, type) {
   T.ocr = Date.now();
   const text = String(r1.data.text || '');
   let textEng = '';
+  let refRetry = false;
   if (ENG_PASS && needEngPass(text)) {
+    try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
+  } else if (ENG_PASS && qr && qr.crcOk !== false && refLooksMissing(qr.transRef, text)) {
+    // QR ถูกต้อง แต่หาเลขที่รายการในข้อความไม่เจอ -> อ่านรอบ 2 กันบอทตีว่า "เลขไม่ตรงกับ QR" ผิด ๆ
+    refRetry = true;
     try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
   }
   await recycleIfHeavy();
   T.end = Date.now();
-  const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
+  const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2' + (refRetry ? ' (เช็กเลขอ้างอิง)' : '') + ' ' + (T.end - T.ocr) : '') + ' ms';
   return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
 }
 

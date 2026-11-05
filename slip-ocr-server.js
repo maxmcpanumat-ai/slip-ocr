@@ -120,11 +120,36 @@ function needEngPass(text) {
   return !money.some(v => v > 0);
 }
 async function recycleIfHeavy() {
-  const rss = Math.round(process.memoryUsage().rss / 1048576);
+  const rssMB = () => Math.round(process.memoryUsage().rss / 1048576);
+  const rss = rssMB();
   if (rss < RECYCLE_MB) return;
-  await closeEng();
+  // ⚡ ปิดตัวอ่านรอบ 2 ก่อน (ใช้ไม่บ่อย) -> แรมลดพอ ก็เก็บตัวอ่านหลักไว้ ไม่ต้องโหลดภาษาใหม่ (โหลดใหม่ใช้หลายวินาที)
+  if (engP) {
+    await closeEng();
+    await new Promise(r => setTimeout(r, 50));
+    const after = rssMB();
+    if (after < RECYCLE_MB) { console.log('♻️ [OCR] แรม ' + rss + ' MB -> ปิดตัวอ่านรอบ 2 เหลือ ' + after + ' MB (ตัวอ่านหลักยังพร้อม)'); return; }
+  }
   await closeMain();
   console.log('♻️ [OCR] แรม ' + rss + ' MB เกิน ' + RECYCLE_MB + ' MB -> เปิดตัวอ่านใหม่');
+}
+
+// ---------- ♻️ รูปเดิมซ้ำ (ลูกค้าส่งซ้ำ / บอทลองใหม่ / กดตรวจใหม่) -> ใช้ผลที่อ่านไว้แล้ว ไม่ต้องอ่านใหม่ ----------
+// ผลอ่านของรูปเดิมเหมือนเดิมทุกครั้งอยู่แล้ว · เก็บ 200 รูปล่าสุด 1 ชั่วโมง (ข้อความล้วน ใช้แรมไม่ถึง 1 MB)
+const CACHE_MAX = Number(process.env.OCR_CACHE_MAX) || 200;
+const CACHE_MS = 60 * 60 * 1000;
+const resultCache = new Map();
+const inflight = new Map();
+function cacheGet(key) {
+  const c = resultCache.get(key);
+  if (!c) return null;
+  if (Date.now() - c.at > CACHE_MS) { resultCache.delete(key); return null; }
+  return c.out;
+}
+function cachePut(key, out) {
+  resultCache.delete(key);
+  resultCache.set(key, { out, at: Date.now() });
+  while (resultCache.size > CACHE_MAX) resultCache.delete(resultCache.keys().next().value);
 }
 
 // ---------- คิว: อ่านทีละรูป (กันแรมเต็ม) ----------
@@ -177,8 +202,12 @@ function prepareImage(src, fallbackBuf, targetWidth) {
     if (W * H > 6e6) return fallbackBuf;
     const g = new Float32Array(w * h);
     for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
-    // ⚡ เขียนเป็น PNG ขาวดำ 1 ช่องสี + บีบอัดเบา ๆ (เร็วกว่า RGBA บีบอัดเต็มหลายเท่า)
-    const outBuf = Buffer.alloc(W * H);
+    // ⚡ ส่งให้ Tesseract เป็นไฟล์ PGM (ภาพขาวดำแบบไม่บีบอัด) แทน PNG
+    //    พิกเซลเหมือนเดิมทุกจุด -> ผลอ่านเหมือนเดิมทุกตัวอักษร แต่ไม่ต้องบีบอัด/คลายไฟล์ (เร็วขึ้น ~0.5-1 วิ บน Render ฟรี)
+    const head = Buffer.from('P5\n' + W + ' ' + H + '\n255\n', 'ascii');
+    const all = Buffer.alloc(head.length + W * H);
+    head.copy(all, 0);
+    const outBuf = all.subarray(head.length);
     if (scale < 0.75) {
       // ย่อมาก: เฉลี่ยพิกเซลเป็นบล็อก (คมกว่าเลือกจุด)
       const inv = 1 / scale;
@@ -200,7 +229,7 @@ function prepareImage(src, fallbackBuf, targetWidth) {
         }
       }
     }
-    return PNG.sync.write({ width: W, height: H, data: outBuf }, { colorType: 0, inputColorType: 0, inputHasAlpha: false, bitDepth: 8, deflateLevel: 1 });
+    return all;
   } catch (e) { console.error('⚠️ [OCR] เตรียมรูปไม่สำเร็จ ใช้รูปเดิม:', e.message); return fallbackBuf; }
 }
 
@@ -342,67 +371,94 @@ app.post('/ocr', async (req, res) => {
   if (buf.length > MAX_BYTES) return res.status(413).json({ success: false, error: 'FILE_TOO_LARGE' });
   const type = imageType(buf);
   if (!type) return res.status(415).json({ success: false, error: 'IMAGE_FORMAT_UNSUPPORTED' });
-  if (pending >= MAX_QUEUE) return res.status(503).json({ success: false, error: 'BUSY' });
   const t0 = Date.now();
-  // บอทเลิกรอแล้ว (หมดเวลา/ตัดการเชื่อมต่อ) -> ไม่ต้องอ่านรูปนี้ ไม่ให้คิวยาวโดยเปล่าประโยชน์
-  let gone = false;
-  res.on('close', () => { if (!res.writableFinished) gone = true; });
-  try {
-    const out = await runQueued(async () => {
-      if (gone) { const err = new Error('CLIENT_GONE'); err.gone = true; throw err; }
-      const T = { s: Date.now() };
-      let rgba = decodeRGBA(buf, type);
-      // ⚡ หา QR จุดที่เจอบ่อยก่อน (เร็ว) · ยังไม่เจอ -> เช็กก่อนว่าเป็นสลิปไหม ค่อยหาละเอียด (ช้า)
-      let qr = findSlipQr(rgba, 1);
-      // รูปเล็ก (เช่น แคปจอย่อ) หา QR แบบละเอียดได้เร็ว -> ทำเลย
-      if (!qr && rgba && Math.max(rgba.width, rgba.height) < 1000) { qr = findSlipQr(rgba, 2); T.qrSmallDone = true; }
-      T.qr = Date.now();
-      const main = await getMain();
-      // ⚡ ไม่พบ QR -> อ่านเร็ว ๆ จากรูปย่อก่อน (ราว 1/3 ของเวลาอ่านเต็ม)
-      // ไม่มีคำที่พบในสลิปเลย = ไม่ใช่สลิป (รูปพระ/สินค้า/ที่อยู่) -> หยุดเลย ไม่อ่านเต็ม ไม่ให้คิวช้า
-      // สลิปที่มี QR (เกือบทั้งหมด) ไม่ผ่านขั้นนี้ -> เร็วเท่าเดิม
-      if (!qr && QUICK_CHECK && rgba) {
-        const fullW = Math.round(rgba.width * Math.min(3, OCR_TARGET_WIDTH / rgba.width));
-        if (fullW > QUICK_WIDTH * 1.25) {
-          const small = prepareImage(rgba, buf, QUICK_WIDTH);
-          const rq = await recognizeSafe(main, small, 'main');
-          T.quick = Date.now();
-          const qt = String(rq.data.text || '');
-          if (!looksLikeSlipText(qt)) {
-            T.qr2 = 0;
-            await recycleIfHeavy();
-            return { text: qt.trim() ? qt : '(ไม่พบข้อความในรูป)', textEng: '', qr: null, notSlip: true, confidence: Math.round(Number(rq.data.confidence) || 0),
-              timing: 'QR ' + (T.qr - T.s) + ' · เช็กสลิป ' + (T.quick - T.qr) + ' ms · ไม่ใช่สลิป ข้ามการอ่านเต็ม' };
-          }
-        }
-      }
-      // น่าจะเป็นสลิป (หรือรูปเล็กที่ไม่ได้เช็กเร็ว) -> หา QR แบบละเอียดต่อ
-      if (!qr && !T.qrSmallDone) { const tq = Date.now(); qr = findSlipQr(rgba, 2); T.qr2 = Date.now() - tq; }
-      const tPrep0 = Date.now();
-      const img = prepareImage(rgba, buf);
-      rgba = null;
-      T.prep = Date.now();
-      const r1 = await recognizeSafe(main, img, 'main');
-      T.ocr = Date.now();
-      const text = String(r1.data.text || '');
-      let textEng = '';
-      if (ENG_PASS && needEngPass(text)) {
-        try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
-      }
-      await recycleIfHeavy();
-      T.end = Date.now();
-      const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
-      return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
+  const key = crypto.createHash('sha1').update(buf).digest('hex');
+  const hit = cacheGet(key);
+  if (hit) {
+    console.log('♻️ [OCR] รูปเดิม ใช้ผลที่อ่านไว้แล้ว (' + Math.round(buf.length / 1024) + ' KB · ' + (hit.qr ? 'QR ' + hit.qr.transRef : 'ไม่พบ QR') + ')');
+    return res.json({ success: true, ...hit, cached: true, ms: Date.now() - t0 });
+  }
+  // รูปเดียวกันกำลังอ่านอยู่ (เช่น บอทลองใหม่ระหว่างที่ยังอ่านไม่เสร็จ) -> รอผลเดียวกัน ไม่เข้าคิวซ้ำ
+  let job = inflight.get(key);
+  if (!job && pending >= MAX_QUEUE) return res.status(503).json({ success: false, error: 'BUSY' });
+  if (!job) {
+    job = { waiting: 0 };
+    // ทุกคนที่รอรูปนี้เลิกรอแล้ว (หมดเวลา/ตัดการเชื่อมต่อ) -> ไม่ต้องอ่าน ไม่ให้คิวยาวโดยเปล่าประโยชน์
+    job.p = runQueued(() => {
+      if (job.waiting <= 0) { const err = new Error('CLIENT_GONE'); err.gone = true; throw err; }
+      return readSlipImage(buf, type);
     });
+    inflight.set(key, job);
+    job.p.then(out => cachePut(key, out), () => {}).finally(() => { if (inflight.get(key) === job) inflight.delete(key); });
+  }
+  job.waiting++;
+  let left = false;
+  res.on('close', () => { if (!res.writableFinished && !left) { left = true; job.waiting--; } });
+  try {
+    const out = await job.p;
+    if (left) return;
     const ms = Date.now() - t0;
+    if (job.logged) {
+      console.log('♻️ [OCR] รูปเดียวกับที่เพิ่งอ่าน (ส่งเข้ามาซ้ำระหว่างอ่าน) ใช้ผลเดียวกัน · รอ ' + ms + ' ms');
+      return res.json({ success: true, ...out, cached: true, ms });
+    }
+    job.logged = true;
     console.log('🧾 [OCR] อ่านรูป ' + Math.round(buf.length / 1024) + ' KB ใน ' + ms + ' ms (' + (out.notSlip ? 'ไม่ใช่สลิป' : 'ความมั่นใจ ' + out.confidence + '%') + (out.qr ? ' · QR ' + out.qr.transRef : ' · ไม่พบ QR') + ') [' + out.timing + ']');
     res.json({ success: true, ...out, ms });
   } catch (e) {
     if (e && e.gone) { console.log('⏭️ [OCR] ข้ามรูปที่บอทเลิกรอแล้ว (รอคิว ' + Math.round((Date.now() - t0) / 1000) + ' วิ)'); return; }
+    if (left) return;
     console.error('❌ [OCR] อ่านไม่สำเร็จ:', e.message || e);
     res.status(500).json({ success: false, error: 'OCR_FAILED', detail: String(e.message || e).slice(0, 200) });
   }
 });
+
+// อ่านรูปสลิป 1 รูป (ทำในคิว ทีละรูป)
+async function readSlipImage(buf, type) {
+  const T = { s: Date.now() };
+  let rgba = decodeRGBA(buf, type);
+  // ⚡ หา QR จุดที่เจอบ่อยก่อน (เร็ว) · ยังไม่เจอ -> เช็กก่อนว่าเป็นสลิปไหม ค่อยหาละเอียด (ช้า)
+  let qr = findSlipQr(rgba, 1);
+  // รูปเล็ก (เช่น แคปจอย่อ) หา QR แบบละเอียดได้เร็ว -> ทำเลย
+  if (!qr && rgba && Math.max(rgba.width, rgba.height) < 1000) { qr = findSlipQr(rgba, 2); T.qrSmallDone = true; }
+  T.qr = Date.now();
+  const main = await getMain();
+  // ⚡ ไม่พบ QR -> อ่านเร็ว ๆ จากรูปย่อก่อน (ราว 1/3 ของเวลาอ่านเต็ม)
+  // ไม่มีคำที่พบในสลิปเลย = ไม่ใช่สลิป (รูปพระ/สินค้า/ที่อยู่) -> หยุดเลย ไม่อ่านเต็ม ไม่ให้คิวช้า
+  // สลิปที่มี QR (เกือบทั้งหมด) ไม่ผ่านขั้นนี้ -> เร็วเท่าเดิม
+  if (!qr && QUICK_CHECK && rgba) {
+    const fullW = Math.round(rgba.width * Math.min(3, OCR_TARGET_WIDTH / rgba.width));
+    if (fullW > QUICK_WIDTH * 1.25) {
+      const small = prepareImage(rgba, buf, QUICK_WIDTH);
+      const rq = await recognizeSafe(main, small, 'main');
+      T.quick = Date.now();
+      const qt = String(rq.data.text || '');
+      if (!looksLikeSlipText(qt)) {
+        T.qr2 = 0;
+        await recycleIfHeavy();
+        return { text: qt.trim() ? qt : '(ไม่พบข้อความในรูป)', textEng: '', qr: null, notSlip: true, confidence: Math.round(Number(rq.data.confidence) || 0),
+          timing: 'QR ' + (T.qr - T.s) + ' · เช็กสลิป ' + (T.quick - T.qr) + ' ms · ไม่ใช่สลิป ข้ามการอ่านเต็ม' };
+      }
+    }
+  }
+  // น่าจะเป็นสลิป (หรือรูปเล็กที่ไม่ได้เช็กเร็ว) -> หา QR แบบละเอียดต่อ
+  if (!qr && !T.qrSmallDone) { const tq = Date.now(); qr = findSlipQr(rgba, 2); T.qr2 = Date.now() - tq; }
+  const tPrep0 = Date.now();
+  const img = prepareImage(rgba, buf);
+  rgba = null;
+  T.prep = Date.now();
+  const r1 = await recognizeSafe(main, img, 'main');
+  T.ocr = Date.now();
+  const text = String(r1.data.text || '');
+  let textEng = '';
+  if (ENG_PASS && needEngPass(text)) {
+    try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
+  }
+  await recycleIfHeavy();
+  T.end = Date.now();
+  const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2 ' + (T.end - T.ocr) : '') + ' ms';
+  return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
+}
 
 process.on('unhandledRejection', (e) => console.error('⚠️ [Unhandled Rejection]', e && e.message || e));
 process.on('uncaughtException', (e) => console.error('⚠️ [Uncaught Exception]', e && e.stack || e));

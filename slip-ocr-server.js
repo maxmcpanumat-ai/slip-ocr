@@ -15,6 +15,8 @@ try { jpeg = require('jpeg-js'); PNG = require('pngjs').PNG; } catch (e) { conso
 try { jsQR = require('jsqr'); } catch (e) { console.warn('⚠️ [OCR] ไม่มี jsqr -> ไม่อ่าน QR บนสลิป'); }
 
 const PORT = process.env.PORT || 3000;
+// เวอร์ชันของไฟล์นี้ (ปุ่ม "ทดสอบการเชื่อมต่อ" ในบอทจะแสดง -> เช็กได้ว่าเซิร์ฟเวอร์ทุกตัว Deploy ตัวเดียวกันแล้ว)
+const OCR_VERSION = '2026-11-06';
 const OCR_SECRET = String(process.env.OCR_SECRET || '');
 const LANGS = (process.env.OCR_LANGS || 'tha+eng').split('+').map(s => s.trim()).filter(Boolean);
 const ENG_PASS = process.env.OCR_ENG_PASS !== '0';
@@ -229,6 +231,55 @@ function runQueued(fn) {
   return p;
 }
 
+// ---------- 🔥 อุ่นเครื่องตอนเปิดเซิร์ฟเวอร์ ----------
+// รูปแรกหลัง Deploy/รีสตาร์ตช้ากว่ารูปถัด ๆ ไปมาก (โค้ดยังไม่ถูกปรับให้เร็ว + ตัวอ่านรอบ 2 ยังไม่โหลด)
+// -> ตอนเปิดเครื่อง อ่านรูปตัวเลขที่วาดขึ้นเอง 1 รูป (ผ่านขั้นตอนเดียวกับสลิปจริง) ให้สลิปแรกของลูกค้าไม่ช้า
+// ไม่เกี่ยวกับผลอ่านสลิป: ตัวอ่านไม่จำอะไรจากรูปก่อนหน้า (ทดสอบแล้ว ผลอ่านเหมือนเดิมทุกตัวอักษร) · ปิดได้ด้วย OCR_WARMUP=0
+const WARM_FONT = { // ตัวเลข 5x7 จุด
+  '0': [14, 17, 19, 21, 25, 17, 14], '1': [4, 12, 4, 4, 4, 4, 14], '2': [14, 17, 1, 2, 4, 8, 31], '3': [30, 1, 1, 14, 1, 1, 30],
+  '4': [2, 6, 10, 18, 31, 2, 2], '5': [31, 16, 30, 1, 1, 17, 14], '6': [6, 8, 16, 30, 17, 17, 14], '7': [31, 1, 2, 4, 8, 8, 8],
+  '8': [14, 17, 17, 14, 17, 17, 14], '9': [14, 17, 17, 15, 1, 2, 12], '.': [0, 0, 0, 0, 0, 12, 12], ',': [0, 0, 0, 0, 12, 4, 8],
+  ':': [0, 12, 12, 0, 12, 12, 0], '-': [0, 0, 0, 31, 0, 0, 0]
+};
+function warmupImage() {
+  const lines = ['2026110571 1234', '05-11-2569 23:07', '1,234.00 270.00', '009-4 8969'];
+  const S = 4, CW = 6 * S, CH = 10 * S, W = 800, H = (lines.length + 2) * CH;
+  const data = new Uint8Array(W * H * 4).fill(255);
+  lines.forEach((t, li) => {
+    for (let ci = 0; ci < t.length; ci++) {
+      const rows = WARM_FONT[t[ci]];
+      if (!rows) continue;
+      const ox = 40 + ci * CW, oy = CH + li * CH;
+      for (let r = 0; r < 7; r++) for (let c = 0; c < 5; c++) {
+        if (!(rows[r] & (16 >> c))) continue;
+        for (let yy = 0; yy < S; yy++) for (let xx = 0; xx < S; xx++) {
+          const i = ((oy + r * S + yy) * W + ox + c * S + xx) * 4;
+          data[i] = data[i + 1] = data[i + 2] = 25;
+        }
+      }
+    }
+  });
+  return { data, width: W, height: H };
+}
+async function warmUp() {
+  if (process.env.OCR_WARMUP === '0') { getMain().catch(() => {}); return; }
+  const t0 = Date.now();
+  try {
+    await runQueued(async () => {
+      const raw = warmupImage();
+      const jpg = jpeg ? jpeg.encode(raw, 90).data : null;
+      const rgba = (jpg && decodeRGBA(jpg, 'jpeg')) || raw;
+      findSlipQr(rgba, 1);
+      const img = prepareImage(rgba, null);
+      const main = await getMain();
+      if (img) await recognizeSafe(main, img, 'main');
+      if (img && ENG_PASS) await engPass(img);
+      await recycleIfHeavy();
+    });
+    console.log('🔥 [OCR] อุ่นเครื่องเสร็จใน ' + (Date.now() - t0) + ' ms (สลิปแรกหลังเปิดเครื่องจะไม่ช้า)');
+  } catch (e) { console.error('⚠️ [OCR] อุ่นเครื่องไม่สำเร็จ (ไม่กระทบการอ่านสลิป):', e.message || e); }
+}
+
 function keyOk(req) {
   if (!OCR_SECRET) return false;
   const got = Buffer.from(String(req.get('x-ocr-key') || ''));
@@ -278,21 +329,31 @@ function prepareImage(src, fallbackBuf, targetWidth) {
     if (scale < 0.75) {
       // ย่อมาก: เฉลี่ยพิกเซลเป็นบล็อก (คมกว่าเลือกจุด)
       const inv = 1 / scale;
+      const SX0 = new Int32Array(W), SX1 = new Int32Array(W);
+      for (let x = 0; x < W; x++) { SX0[x] = Math.floor(x * inv); SX1[x] = Math.min(w, Math.floor((x + 1) * inv)); }
       for (let y = 0; y < H; y++) {
         const sy0 = Math.floor(y * inv), sy1 = Math.min(h, Math.floor((y + 1) * inv));
         for (let x = 0; x < W; x++) {
-          const sx0 = Math.floor(x * inv), sx1 = Math.min(w, Math.floor((x + 1) * inv));
+          const sx0 = SX0[x], sx1 = SX1[x];
           let sum = 0, n = 0;
           for (let yy = sy0; yy < sy1; yy++) for (let xx = sx0; xx < sx1; xx++) { sum += g[yy * w + xx]; n++; }
           outBuf[y * W + x] = n ? sum / n : 255;
         }
       }
     } else {
+      // ⚡ คำนวณตำแหน่ง/น้ำหนักของแต่ละคอลัมน์ไว้ครั้งเดียว (เดิมคำนวณซ้ำทุกพิกเซล)
+      //    สูตรและลำดับการคำนวณเหมือนเดิมทุกขั้น -> ได้พิกเซลเหมือนเดิมทุกจุด (ผลอ่านไม่เปลี่ยน)
+      const X0 = new Int32Array(W), X1 = new Int32Array(W), TX = new Float64Array(W), ITX = new Float64Array(W);
+      for (let x = 0; x < W; x++) {
+        const fx = Math.min(w - 1, (x + 0.5) / scale - 0.5), x0 = Math.max(0, Math.floor(fx)), tx = Math.max(0, fx - x0);
+        X0[x] = x0; X1[x] = Math.min(w - 1, x0 + 1); TX[x] = tx; ITX[x] = 1 - tx;
+      }
       for (let y = 0; y < H; y++) {
         const fy = Math.min(h - 1, (y + 0.5) / scale - 0.5), y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(h - 1, y0 + 1), ty = Math.max(0, fy - y0);
+        const r0 = y0 * w, r1 = y1 * w, ity = 1 - ty, o = y * W;
         for (let x = 0; x < W; x++) {
-          const fx = Math.min(w - 1, (x + 0.5) / scale - 0.5), x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(w - 1, x0 + 1), tx = Math.max(0, fx - x0);
-          outBuf[y * W + x] = (g[y0 * w + x0] * (1 - tx) + g[y0 * w + x1] * tx) * (1 - ty) + (g[y1 * w + x0] * (1 - tx) + g[y1 * w + x1] * tx) * ty;
+          const x0 = X0[x], x1 = X1[x], tx = TX[x], itx = ITX[x];
+          outBuf[o + x] = (g[r0 + x0] * itx + g[r0 + x1] * tx) * ity + (g[r1 + x0] * itx + g[r1 + x1] * tx) * ty;
         }
       }
     }
@@ -335,12 +396,15 @@ function scaleCrop(img, x0, y0, w, h, s) {
   const W = Math.round(w * s), H = Math.round(h * s);
   if (W * H > 4e6) return null;
   const o = new Uint8ClampedArray(W * H * 4);
+  // ⚡ ตำแหน่งต้นทางของแต่ละคอลัมน์คำนวณครั้งเดียว (พิกเซลที่ได้เหมือนเดิมทุกจุด)
+  const SX = new Int32Array(W);
+  for (let x = 0; x < W; x++) SX[x] = (x0 + Math.min(w - 1, Math.floor(x / s))) * 4;
+  const src = img.data, iw4 = img.width * 4;
   for (let y = 0; y < H; y++) {
-    const sy = y0 + Math.min(h - 1, Math.floor(y / s));
-    for (let x = 0; x < W; x++) {
-      const sx = x0 + Math.min(w - 1, Math.floor(x / s));
-      const si = (sy * img.width + sx) * 4, di = (y * W + x) * 4;
-      o[di] = img.data[si]; o[di + 1] = img.data[si + 1]; o[di + 2] = img.data[si + 2]; o[di + 3] = 255;
+    const row = (y0 + Math.min(h - 1, Math.floor(y / s))) * iw4;
+    for (let x = 0, di = y * W * 4; x < W; x++, di += 4) {
+      const si = row + SX[x];
+      o[di] = src[si]; o[di + 1] = src[si + 1]; o[di + 2] = src[si + 2]; o[di + 3] = 255;
     }
   }
   return { data: o, width: W, height: H };
@@ -426,7 +490,7 @@ app.get('/healthz', (req, res) => res.type('text').send('ok'));
 // สถานะ (ต้องใช้รหัส) — บอตใช้ปุ่ม "ทดสอบการเชื่อมต่อ"
 app.get('/status', (req, res) => {
   if (!keyOk(req)) return res.status(401).json({ success: false, error: 'UNAUTHORIZED' });
-  res.json({ success: true, ready: !!readyAt, langs: LANGS.concat(ENG_PASS ? ['eng-digits'] : []), qr: !!jsQR, queue: pending, memMB: Math.round(process.memoryUsage().rss / 1048576), uptimeSec: Math.round(process.uptime()) });
+  res.json({ success: true, version: OCR_VERSION, ready: !!readyAt, langs: LANGS.concat(ENG_PASS ? ['eng-digits'] : []), qr: !!jsQR, queue: pending, memMB: Math.round(process.memoryUsage().rss / 1048576), uptimeSec: Math.round(process.uptime()) });
 });
 
 // อ่านข้อความในรูป: body = { image: "<base64>" }
@@ -540,7 +604,8 @@ process.on('uncaughtException', (e) => console.error('⚠️ [Uncaught Exception
 
 app.listen(PORT, () => {
   console.log('🧾 Slip OCR Server พร้อมที่พอร์ต ' + PORT + (OCR_SECRET ? '' : ' · ⚠️ ยังไม่ได้ตั้ง OCR_SECRET (จะปฏิเสธทุกคำขอ)'));
-  getMain().catch(() => {}); // โหลดภาษาไว้ก่อน รูปแรกจะได้ไม่ช้า
+  console.log('🏷️ [OCR] เวอร์ชัน ' + OCR_VERSION);
+  warmUp(); // โหลดภาษา + อุ่นเครื่องไว้ก่อน รูปแรกจะได้ไม่ช้า
   // ☕ ปลุกตัวเองทุก 10 นาที (Render ฟรีหลับเมื่อไม่มีคนเรียก 15 นาที) · ปิดได้ด้วย KEEP_AWAKE=0
   const selfUrl = String(process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
   if (selfUrl && process.env.KEEP_AWAKE !== '0') {

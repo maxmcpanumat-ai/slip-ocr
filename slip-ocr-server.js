@@ -300,6 +300,7 @@ function scaleCropSmooth(img, x0, y0, w, h, s) {
   return { data: o, width: W, height: H };
 }
 // phase 1 = จุดที่ QR สลิปอยู่บ่อย (เร็ว เจอเกือบทุกธนาคาร) · phase 2 = ลองละเอียด (ช้า ใช้เมื่อรู้แล้วว่าน่าจะเป็นสลิป)
+// 'smooth' = เฉพาะขยายแบบเกลี่ยสี (รูปเล็ก · เร็ว) · 'heavy' = ลองละเอียดแบบขยายใหญ่/กลับสี (ช้า) โดยไม่ทำ smooth ซ้ำ
 function findSlipQr(img, phase) {
   if (!jsQR || !img) return null;
   const W = img.width, H = img.height;
@@ -320,7 +321,7 @@ function findSlipQr(img, phase) {
     [0, 0, W, H, fit(2400), 'attemptBoth'],
     [0, H * 0.55, W * 0.5, H * 0.45, up(1000), 'attemptBoth']
   ];
-  const list = phase === 1 ? tries.slice(0, 3) : phase === 2 ? tries.slice(3) : tries;
+  const list = phase === 1 ? tries.slice(0, 3) : (phase === 2 || phase === 'heavy') ? tries.slice(3) : phase === 'smooth' ? [] : tries;
   for (const [x, y, w, h, s, inv] of list) {
     const part = scaleCrop(img, x, y, w, h, s);
     if (!part) continue;
@@ -331,7 +332,7 @@ function findSlipQr(img, phase) {
   }
   // 🔎 รูปเล็ก (QR แค่ไม่กี่สิบพิกเซล เช่น แคปจอ/ส่งต่อ) -> ขยายแบบเกลี่ยสีแล้วลองใหม่ (ทำเฉพาะรูปเล็กที่วิธีปกติหาไม่เจอ)
   // รูปใหญ่ไม่ทำ (QR ใหญ่พออยู่แล้ว) -> รูปที่ไม่ใช่สลิป (รูปพระ/สินค้า) ไม่เสียเวลาเพิ่ม
-  if (phase !== 1 && big < 1000) {
+  if (phase !== 1 && phase !== 'heavy' && big < 1000) {
     const smooth = [
       [W * 0.45, H * 0.4, W * 0.55, H * 0.6],   // ขวาล่าง
       [W * 0.55, 0, W * 0.45, H * 0.45],        // ขวาบน
@@ -419,8 +420,10 @@ async function readSlipImage(buf, type) {
   let rgba = decodeRGBA(buf, type);
   // ⚡ หา QR จุดที่เจอบ่อยก่อน (เร็ว) · ยังไม่เจอ -> เช็กก่อนว่าเป็นสลิปไหม ค่อยหาละเอียด (ช้า)
   let qr = findSlipQr(rgba, 1);
-  // รูปเล็ก (เช่น แคปจอย่อ) หา QR แบบละเอียดได้เร็ว -> ทำเลย
-  if (!qr && rgba && Math.max(rgba.width, rgba.height) < 1000) { qr = findSlipQr(rgba, 2); T.qrSmallDone = true; }
+  // รูปเล็ก (เช่น แคปจอย่อ) -> ลองขยายแบบเกลี่ยสีก่อน (เร็ว เจอ QR รูปเล็กได้ดี)
+  // ส่วนที่ช้า (ขยายใหญ่ 3 เท่า/กลับสี) เก็บไว้ทำหลังเช็กแล้วว่าน่าจะเป็นสลิป -> รูปเล็กที่ไม่ใช่สลิปไม่เสียเวลา
+  const smallImg = !!(rgba && Math.max(rgba.width, rgba.height) < 1000);
+  if (!qr && smallImg) qr = findSlipQr(rgba, 'smooth');
   T.qr = Date.now();
   const main = await getMain();
   // ⚡ ไม่พบ QR -> อ่านเร็ว ๆ จากรูปย่อก่อน (ราว 1/3 ของเวลาอ่านเต็ม)
@@ -442,7 +445,7 @@ async function readSlipImage(buf, type) {
     }
   }
   // น่าจะเป็นสลิป (หรือรูปเล็กที่ไม่ได้เช็กเร็ว) -> หา QR แบบละเอียดต่อ
-  if (!qr && !T.qrSmallDone) { const tq = Date.now(); qr = findSlipQr(rgba, 2); T.qr2 = Date.now() - tq; }
+  if (!qr) { const tq = Date.now(); qr = findSlipQr(rgba, smallImg ? 'heavy' : 2); T.qr2 = Date.now() - tq; }
   const tPrep0 = Date.now();
   const img = prepareImage(rgba, buf);
   rgba = null;

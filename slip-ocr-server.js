@@ -16,7 +16,7 @@ try { jsQR = require('jsqr'); } catch (e) { console.warn('⚠️ [OCR] ไม่
 
 const PORT = process.env.PORT || 3000;
 // เวอร์ชันของไฟล์นี้ (ปุ่ม "ทดสอบการเชื่อมต่อ" ในบอทจะแสดง -> เช็กได้ว่าเซิร์ฟเวอร์ทุกตัว Deploy ตัวเดียวกันแล้ว)
-const OCR_VERSION = '2026-11-06';
+const OCR_VERSION = '2026-11-07';
 const OCR_SECRET = String(process.env.OCR_SECRET || '');
 const LANGS = (process.env.OCR_LANGS || 'tha+eng').split('+').map(s => s.trim()).filter(Boolean);
 const ENG_PASS = process.env.OCR_ENG_PASS !== '0';
@@ -78,10 +78,10 @@ async function closeEng() {
 }
 // ⏱️ กันตัวอ่านค้าง: อ่านรูปเดียวนานเกินกำหนด -> ปิดตัวอ่านแล้วเปิดใหม่ (ไม่ให้คิวทั้งหมดค้างตาม)
 const RECOG_TIMEOUT = Number(process.env.OCR_JOB_TIMEOUT_MS) || 100000;
-async function recognizeSafe(w, img, which) {
+async function recognizeSafe(w, img, which, opts, output) {
   let timer;
   try {
-    return await Promise.race([w.recognize(img), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('OCR_STUCK')), RECOG_TIMEOUT); })]);
+    return await Promise.race([opts || output ? w.recognize(img, opts || {}, output) : w.recognize(img), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('OCR_STUCK')), RECOG_TIMEOUT); })]);
   } catch (e) {
     if (e && e.message === 'OCR_STUCK') {
       console.error('⏱️ [OCR] ตัวอ่าน' + (which === 'eng' ? 'รอบ 2' : '') + 'ค้างเกิน ' + Math.round(RECOG_TIMEOUT / 1000) + ' วิ -> เปิดใหม่');
@@ -93,6 +93,51 @@ async function recognizeSafe(w, img, which) {
 async function engPass(img) {
   const w = await getEng();
   return String((await recognizeSafe(w, img, 'eng')).data.text || '');
+}
+// รอบ 2 + ตำแหน่งคำ (tsv) -> ใช้หาตำแหน่งยอดเงินเพื่ออ่านซ้ำ (ข้อความที่ได้เหมือน engPass ทุกตัวอักษร)
+async function engPassFull(img) {
+  const w = await getEng();
+  const r = await recognizeSafe(w, img, 'eng', {}, { text: true, tsv: true });
+  return { text: String(r.data.text || ''), tsv: String(r.data.tsv || '') };
+}
+// ---------- 💰 อ่านยอดเงินซ้ำ (กันอ่านยอดผิด เช่น 2,100.00 -> 27,100.00) ----------
+// สลิปบางแบบ (MyMo/ออมสิน) ตัวอ่านไทยข้ามยอดตัวใหญ่ไป ยอดจึงมาจากรอบ 2 อย่างเดียว
+// -> หาตำแหน่งยอดเงินที่รอบ 2 อ่านได้ แล้วอ่านเฉพาะกรอบนั้นอีก 2 ครั้ง (ตัวอ่านไทย + ตัวอ่านรอบ 2)
+//    บอทจะเทียบ: อ่านได้ไม่ตรงกัน -> ให้แอดมินตรวจ (ไม่ตอบว่าผ่านด้วยยอดที่อาจผิด)
+const MONEY_TOKEN = /^(\d{1,3}(?:,\d{3})+|\d+)\.\d{2}$/;
+function moneyFromText(t) {
+  const m = String(t || '').replace(/(\d),\s(\d{3})/g, '$1,$2').match(/(?<![\d.,])(\d{1,3}(?:,\d{3})+|\d+)\.(\d{2})(?!\d)/);
+  return m ? parseFloat(m[1].replace(/,/g, '') + '.' + m[2]) : null;
+}
+async function checkAmounts(img, tsv) {
+  const words = String(tsv || '').split('\n').map(l => l.split('\t')).filter(c => c[0] === '5' && c[11] && c[11].trim());
+  const lines = new Map();
+  for (const c of words) {
+    const k = c[2] + '/' + c[3] + '/' + c[4];
+    if (!lines.has(k)) lines.set(k, []);
+    lines.get(k).push({ l: +c[6], t: +c[7], w: +c[8], h: +c[9], s: c[11].trim() });
+  }
+  const found = [];
+  for (const ws of lines.values()) {
+    for (let a = 0; a < ws.length; a++) for (let b = a; b < Math.min(ws.length, a + 3); b++) {
+      const part = ws.slice(a, b + 1), s = part.map(x => x.s).join('');
+      if (!MONEY_TOKEN.test(s)) continue;
+      const v = parseFloat(s.replace(/,/g, ''));
+      if (!(v > 0) || found.some(f => f.v === v)) continue;
+      const L = Math.min(...part.map(x => x.l)), T = Math.min(...part.map(x => x.t));
+      const R = Math.max(...part.map(x => x.l + x.w)), B = Math.max(...part.map(x => x.t + x.h));
+      const pad = Math.max(4, Math.round((B - T) * 0.35));
+      found.push({ v, eng: s, rect: { left: Math.max(0, L - pad), top: Math.max(0, T - pad), width: R - L + 2 * pad, height: B - T + 2 * pad } });
+    }
+  }
+  const out = [];
+  for (const f of found.slice(0, 4)) {
+    let th = null, en = null;
+    try { th = moneyFromText((await recognizeSafe(await getMain(), img, 'main', { rectangle: f.rect })).data.text); } catch (e) {}
+    try { en = moneyFromText((await recognizeSafe(await getEng(), img, 'eng', { rectangle: f.rect })).data.text); } catch (e) {}
+    out.push({ v: f.v, eng: f.eng, th, en });
+  }
+  return out;
 }
 // รอบ 1 อ่านเลขบัญชีที่ปิดบางหลักได้ครบ 2 เลข (ผู้โอน + ผู้รับ) แล้ว -> ไม่ต้องอ่านรอบ 2
 // คำที่พบในสลิปโอนเงิน (ครอบคลุมคำที่บอทใช้ตัดสินว่า "ดูเหมือนสลิป" ทั้งหมด)
@@ -584,19 +629,26 @@ async function readSlipImage(buf, type) {
   const r1 = await recognizeSafe(main, img, 'main');
   T.ocr = Date.now();
   const text = String(r1.data.text || '');
-  let textEng = '';
+  let textEng = '', tsvEng = '';
   let refRetry = false;
-  if (ENG_PASS && needEngPass(text)) {
-    try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
-  } else if (ENG_PASS && qr && qr.crcOk !== false && refLooksMissing(qr.transRef, text)) {
+  const runEng = async () => {
+    try { const r = await engPassFull(img); textEng = r.text; tsvEng = r.tsv; } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
+  };
+  if (ENG_PASS && needEngPass(text)) await runEng();
+  else if (ENG_PASS && qr && qr.crcOk !== false && refLooksMissing(qr.transRef, text)) {
     // QR ถูกต้อง แต่หาเลขที่รายการในข้อความไม่เจอ -> อ่านรอบ 2 กันบอทตีว่า "เลขไม่ตรงกับ QR" ผิด ๆ
     refRetry = true;
-    try { textEng = await engPass(img); } catch (e) { console.error('⚠️ [OCR] รอบตัวเลขไม่สำเร็จ:', e.message); }
+    await runEng();
   }
+  T.eng = Date.now();
+  let amounts;
+  if (tsvEng) { try { amounts = await checkAmounts(img, tsvEng); } catch (e) { console.error('⚠️ [OCR] อ่านยอดซ้ำไม่สำเร็จ:', e.message); } }
   await recycleIfHeavy();
   T.end = Date.now();
-  const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2' + (refRetry ? ' (เช็กเลขอ้างอิง)' : '') + ' ' + (T.end - T.ocr) : '') + ' ms';
-  return { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
+  const timing = 'QR ' + (T.qr - T.s) + (T.quick ? ' · เช็กสลิป ' + (T.quick - T.qr) : '') + (T.qr2 ? ' · QR ละเอียด ' + T.qr2 : '') + ' · เตรียมรูป ' + (T.prep - tPrep0) + ' · อ่าน ' + (T.ocr - T.prep) + (textEng ? ' · รอบ 2' + (refRetry ? ' (เช็กเลขอ้างอิง)' : '') + ' ' + (T.eng - T.ocr) : '') + (amounts && amounts.length ? ' · อ่านยอดซ้ำ ' + (T.end - T.eng) : '') + ' ms';
+  const res = { text, textEng, qr, timing, confidence: Math.round(Number(r1.data.confidence) || 0) };
+  if (amounts) res.amounts = amounts;
+  return res;
 }
 
 process.on('unhandledRejection', (e) => console.error('⚠️ [Unhandled Rejection]', e && e.message || e));
